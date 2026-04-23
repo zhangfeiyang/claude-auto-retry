@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Configuration (overridable via env vars)
+MAX_RETRIES="${CLAUDE_RETRY_MAX:-3}"
+RETRY_INTERVAL="${CLAUDE_RETRY_INTERVAL:-2}"
+ERROR_PATTERN="${CLAUDE_RETRY_PATTERN:-Content block not found}"
+LOG_FILE="${CLAUDE_RETRY_LOG:-$HOME/.claude/plugins/cache/claude-auto-retry/retry.log}"
+LOCK_DIR="/tmp/claude-auto-retry"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$LOCK_DIR"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# --- Session Discovery ---
+find_my_session() {
+    local claude_pid="$PPID"
+    local session_file="$HOME/.claude/sessions/${claude_pid}.json"
+    if [[ -f "$session_file" ]]; then
+        echo "$session_file"
+        return 0
+    fi
+    local latest
+    latest=$(ls -t "$HOME/.claude/sessions/"*.json 2>/dev/null | head -1)
+    if [[ -n "$latest" ]]; then
+        echo "$latest"
+        return 0
+    fi
+    return 1
+}
+
+parse_session() {
+    local session_file="$1"
+    SESSION_ID=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sessionId',''))" < "$session_file")
+    SESSION_CWD=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('cwd',''))" < "$session_file")
+    SESSION_PID=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('pid',''))" < "$session_file")
+}
+
+get_project_dir() {
+    local cwd="$1"
+    local escaped
+    escaped=$(echo "$cwd" | sed 's|/|-|g')
+    echo "$HOME/.claude/projects/${escaped}"
+}
+
+get_pts() {
+    local pid="$1"
+    local tty_link
+    tty_link=$(readlink "/proc/${pid}/fd/0" 2>/dev/null || echo "")
+    if [[ "$tty_link" =~ pts/([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# --- Error Detection ---
+get_last_user_prompt() {
+    local log="$1"
+    python3 -c "
+import json, sys
+last_prompt = ''
+for line in open('$log'):
+    try:
+        obj = json.loads(line)
+    except:
+        continue
+    if obj.get('type') == 'user':
+        msg = obj.get('message', {})
+        content = msg.get('content', '')
+        if isinstance(content, str) and content.strip():
+            last_prompt = content.strip()
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get('type') == 'text':
+                    last_prompt = item.get('text', '').strip()
+                    break
+                elif isinstance(item, str) and item.strip():
+                    last_prompt = item.strip()
+                    break
+print(last_prompt)
+" 2>/dev/null
+}
+
+is_error_line() {
+    local line="$1"
+    echo "$line" | python3 -c "
+import json, sys
+line = sys.stdin.read().strip()
+if not line:
+    sys.exit(1)
+try:
+    obj = json.loads(line)
+except:
+    sys.exit(1)
+if obj.get('type') != 'assistant':
+    sys.exit(1)
+msg = obj.get('message', {})
+content = msg.get('content', [])
+if isinstance(content, list):
+    for c in content:
+        if isinstance(c, dict) and 'Content block not found' in c.get('text', ''):
+            sys.exit(0)
+elif isinstance(content, str) and 'Content block not found' in content:
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
+# --- Retry Injection ---
+inject_prompt() {
+    local pts="$1"
+    local prompt="$2"
+    if [[ -w "/dev/pts/${pts}" ]]; then
+        echo "$prompt" > "/dev/pts/${pts}"
+        log "Injected prompt into /dev/pts/${pts}"
+        return 0
+    else
+        log "ERROR: Cannot write to /dev/pts/${pts}"
+        return 1
+    fi
+}
+
+# --- Daemon Check ---
+is_claude_alive() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null
+}
+
+# --- Main ---
+main() {
+    log "Daemon starting (PPID=$PPID)"
+
+    local lock_file="${LOCK_DIR}/daemon-$$"
+    if [[ -f "$lock_file" ]]; then
+        log "Another daemon instance exists for PID $$, exiting"
+        exit 0
+    fi
+    echo "$$" > "$lock_file"
+    trap "rm -f '$lock_file'" EXIT
+
+    local session_file
+    session_file=$(find_my_session) || {
+        log "No session file found, exiting"
+        exit 1
+    }
+    log "Session file: $session_file"
+
+    parse_session "$session_file"
+    log "Session ID: $SESSION_ID, CWD: $SESSION_CWD, PID: $SESSION_PID"
+
+    local project_dir
+    project_dir=$(get_project_dir "$SESSION_CWD")
+    local session_log="${project_dir}/${SESSION_ID}.jsonl"
+
+    if [[ ! -f "$session_log" ]]; then
+        log "Session log not found: $session_log, exiting"
+        exit 1
+    fi
+    log "Monitoring: $session_log"
+
+    local pts
+    pts=$(get_pts "$SESSION_PID") || {
+        log "Cannot determine PTS for PID $SESSION_PID"
+        exit 1
+    }
+    log "PTS: $pts"
+
+    local retry_count=0
+    local last_error_uuid=""
+
+    log "Daemon ready, monitoring for errors..."
+
+    tail -f "$session_log" 2>/dev/null | while IFS= read -r line; do
+        if ! is_claude_alive "$SESSION_PID"; then
+            log "Claude process $SESSION_PID exited, stopping daemon"
+            break
+        fi
+
+        if echo "$line" | grep -q "$ERROR_PATTERN"; then
+            if is_error_line "$line"; then
+                local current_uuid
+                current_uuid=$(echo "$line" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('uuid',''))" 2>/dev/null || echo "")
+
+                if [[ "$current_uuid" == "$last_error_uuid" ]]; then
+                    continue
+                fi
+                last_error_uuid="$current_uuid"
+                retry_count=$((retry_count + 1))
+
+                log "Detected error (attempt $retry_count/$MAX_RETRIES, uuid=$current_uuid)"
+
+                if [[ $retry_count -gt $MAX_RETRIES ]]; then
+                    log "Max retries ($MAX_RETRIES) exceeded, stopping"
+                    break
+                fi
+
+                local prompt
+                prompt=$(get_last_user_prompt "$session_log")
+
+                if [[ -z "$prompt" ]]; then
+                    log "No user prompt found to retry"
+                    continue
+                fi
+
+                log "Retrying with prompt: ${prompt:0:80}..."
+
+                sleep "$RETRY_INTERVAL"
+                inject_prompt "$pts" "$prompt"
+            fi
+        fi
+    done
+
+    log "Daemon exiting"
+}
+
+main "$@"
