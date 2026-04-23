@@ -22,6 +22,8 @@ Claude Code sometimes hits transient API errors like "Content block not found" â
 claude plugins install github:<your-username>/claude-auto-retry
 ```
 
+This will automatically configure the SessionStart hook.
+
 ### Manual Installation
 
 Clone into your plugins directory:
@@ -31,12 +33,26 @@ git clone https://github.com/<your-username>/claude-auto-retry.git \
   ~/.claude/plugins/cache/local/claude-auto-retry
 ```
 
-Then enable in `~/.claude/settings.json`:
+Then add to `~/.claude/settings.json`:
 
 ```json
 {
   "enabledPlugins": {
     "claude-auto-retry@local": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${HOME}/.claude/plugins/cache/local/claude-auto-retry/hooks/run-hook\" retry-daemon",
+            "async": true
+          }
+        ]
+      }
+    ]
   }
 }
 ```
