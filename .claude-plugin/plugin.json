@@ -1,0 +1,15 @@
+{
+  "name": "claude-auto-retry",
+  "description": "Automatically retries Claude Code prompts when 'Content block not found' API errors occur",
+  "version": "1.0.0",
+  "author": {
+    "name": "zhangfy"
+  },
+  "license": "MIT",
+  "keywords": [
+    "retry",
+    "error-handling",
+    "auto-retry",
+    "resilience"
+  ]
+}
